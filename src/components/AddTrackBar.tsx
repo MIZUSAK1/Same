@@ -1,10 +1,12 @@
 import { type FormEvent, useEffect, useState } from 'react';
-import { Link2, Loader2, Plus, X } from 'lucide-react';
-import type { Role } from '../types/room';
-import { extractYouTubeVideoId, getYouTubeThumbnail } from '../utils/youtube';
+import { Link2, Loader2, Music2, Plus, X } from 'lucide-react';
+import type { MediaProvider, Role } from '../types/room';
+import { getProviderLabel, parseMediaUrl } from '../utils/media';
 
 interface PreviewMeta {
-  videoId: string;
+  provider: MediaProvider;
+  mediaId: string;
+  sourceUrl: string;
   title: string;
   author: string;
   thumbnailUrl: string;
@@ -13,7 +15,15 @@ interface PreviewMeta {
 interface AddTrackBarProps {
   role: Role;
   onAddTrack: (
-    track: { id: string; videoId: string; title: string; author: string; thumbnailUrl: string },
+    track: {
+      id: string;
+      provider: MediaProvider;
+      sourceUrl: string;
+      mediaId: string;
+      title: string;
+      author: string;
+      thumbnailUrl: string;
+    },
     playImmediately: boolean,
   ) => void;
 }
@@ -24,7 +34,7 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
   const [isLoadingMeta, setIsLoadingMeta] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
 
-  const parsedId = extractYouTubeVideoId(inputUrl);
+  const parsed = parseMediaUrl(inputUrl);
 
   useEffect(() => {
     if (!inputUrl.trim()) {
@@ -34,7 +44,7 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
       return;
     }
 
-    if (!parsedId) {
+    if (!parsed) {
       setPreview(null);
       setIsLoadingMeta(false);
       return;
@@ -46,7 +56,7 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
 
     const timer = window.setTimeout(async () => {
       try {
-        const res = await fetch(`/api/youtube-meta?videoId=${encodeURIComponent(parsedId)}`);
+        const res = await fetch(`/api/media-meta?url=${encodeURIComponent(inputUrl.trim())}`);
         if (!res.ok) throw new Error('meta error');
         const data = (await res.json()) as PreviewMeta;
         if (!cancelled) {
@@ -54,36 +64,45 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
         }
       } catch {
         if (!cancelled) {
+          const label = getProviderLabel(parsed.provider);
           setPreview({
-            videoId: parsedId,
-            title: `YouTube 影片 (${parsedId})`,
-            author: 'YouTube',
-            thumbnailUrl: getYouTubeThumbnail(parsedId),
+            provider: parsed.provider,
+            mediaId: parsed.mediaId,
+            sourceUrl: parsed.sourceUrl,
+            title: `${label} 曲目`,
+            author: label,
+            thumbnailUrl:
+              parsed.provider === 'youtube'
+                ? `https://i.ytimg.com/vi/${parsed.mediaId}/hqdefault.jpg`
+                : '',
           });
         }
       } finally {
         if (!cancelled) setIsLoadingMeta(false);
       }
-    }, 200);
+    }, 250);
 
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [inputUrl, parsedId]);
+  }, [inputUrl]);
 
   const submitTrack = async () => {
-    const videoId = extractYouTubeVideoId(inputUrl);
-    if (!videoId) {
-      setValidationError('請貼上有效的 YouTube 影片連結（例如 youtube.com/watch?v=... 或 youtu.be/...）');
+    const trimmed = inputUrl.trim();
+    const currentParsed = parseMediaUrl(trimmed);
+    if (!currentParsed) {
+      setValidationError(
+        '請貼上支援的音樂或影片連結（YouTube、SoundCloud、Bilibili、Twitch、Spotify、Apple Music、KKBOX）',
+      );
       return;
     }
 
-    let meta = preview && preview.videoId === videoId ? preview : null;
+    let meta = preview && preview.sourceUrl === currentParsed.sourceUrl ? preview : null;
     if (!meta) {
       setIsLoadingMeta(true);
       try {
-        const res = await fetch(`/api/youtube-meta?videoId=${encodeURIComponent(videoId)}`);
+        const res = await fetch(`/api/media-meta?url=${encodeURIComponent(trimmed)}`);
         if (res.ok) {
           meta = (await res.json()) as PreviewMeta;
         }
@@ -94,11 +113,17 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
       }
     }
 
+    const label = getProviderLabel(currentParsed.provider);
     const finalMeta: PreviewMeta = meta || {
-      videoId,
-      title: `YouTube 影片 (${videoId})`,
-      author: 'YouTube',
-      thumbnailUrl: getYouTubeThumbnail(videoId),
+      provider: currentParsed.provider,
+      mediaId: currentParsed.mediaId,
+      sourceUrl: currentParsed.sourceUrl,
+      title: `${label} 曲目`,
+      author: label,
+      thumbnailUrl:
+        currentParsed.provider === 'youtube'
+          ? `https://i.ytimg.com/vi/${currentParsed.mediaId}/hqdefault.jpg`
+          : '',
     };
 
     const uniqueId =
@@ -109,7 +134,9 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
     onAddTrack(
       {
         id: uniqueId,
-        videoId: finalMeta.videoId,
+        provider: finalMeta.provider,
+        sourceUrl: finalMeta.sourceUrl,
+        mediaId: finalMeta.mediaId,
         title: finalMeta.title,
         author: finalMeta.author,
         thumbnailUrl: finalMeta.thumbnailUrl,
@@ -128,7 +155,7 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
   };
 
   return (
-    <section aria-label="加入 YouTube 歌曲" className="border-b border-white/8 bg-[#121419]">
+    <section aria-label="加入歌曲連結" className="border-b border-white/8 bg-[#121419]">
       <div className="mx-auto max-w-[1440px] px-4 py-4 sm:px-6">
         <form onSubmit={handleFormSubmit} className="flex flex-col gap-3 lg:flex-row lg:items-center">
           <div className="relative flex-1">
@@ -143,8 +170,8 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
                 setInputUrl(e.target.value);
                 if (validationError) setValidationError(null);
               }}
-              placeholder="貼上 YouTube 連結（支援 watch、youtu.be、Shorts 或 YouTube Music）"
-              aria-label="YouTube 影片連結"
+              placeholder="貼上連結（支援 YouTube、SoundCloud、Bilibili、Twitch、Spotify、Apple Music、KKBOX）"
+              aria-label="音樂或影片連結"
               className="h-11 w-full rounded-lg border border-white/12 bg-[#0D0E11] pl-10 pr-10 text-sm text-[#F3F4F6] placeholder-[#6B7280] transition-colors focus:border-[#E59F3C] focus:outline-none focus-visible:ring-2 focus-visible:ring-[#E59F3C]/40"
             />
             {inputUrl && (
@@ -187,16 +214,24 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
 
         {!validationError && preview && (
           <div className="mt-3 flex items-center gap-3 text-xs text-[#9CA3AF]">
-            <img
-              src={preview.thumbnailUrl}
-              alt={preview.title}
-              referrerPolicy="no-referrer"
-              className="h-9 w-16 rounded object-cover bg-[#1B1E25] shrink-0"
-            />
+            {preview.thumbnailUrl ? (
+              <img
+                src={preview.thumbnailUrl}
+                alt={preview.title}
+                referrerPolicy="no-referrer"
+                className="h-9 w-16 rounded object-cover bg-[#1B1E25] shrink-0"
+              />
+            ) : (
+              <div className="flex h-9 w-16 shrink-0 items-center justify-center rounded border border-white/8 bg-[#1B1E25] text-[#9CA3AF]">
+                <Music2 className="h-4 w-4" />
+              </div>
+            )}
             <div className="min-w-0 flex-1">
               <p className="truncate font-medium text-[#F3F4F6]">{preview.title}</p>
               <p className="truncate text-[#9CA3AF]">
-                {preview.author}
+                <span>{getProviderLabel(preview.provider)}</span>
+                <span aria-hidden="true"> · </span>
+                <span>{preview.author}</span>
                 <span aria-hidden="true"> · </span>
                 <span>解析成功，可加入待播</span>
               </p>
@@ -206,7 +241,7 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
 
         {!validationError && !preview && role === 'friend' && (
           <p className="mt-2 text-xs text-[#9CA3AF]">
-            你目前以朋友身份加入：你可以自由貼上 YouTube 連結加入待播清單，切換歌曲與播放進度由房主統一控制。
+            你目前以朋友身份加入：你可以自由貼上各平台連結加入待播清單，切換歌曲與播放進度由房主統一控制。
           </p>
         )}
       </div>

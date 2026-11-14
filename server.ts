@@ -6,6 +6,7 @@ import { createServer as createViteServer } from 'vite';
 import { WebSocketServer, WebSocket } from 'ws';
 import type {
   ClientMessage,
+  MediaProvider,
   Participant,
   PlaybackState,
   Role,
@@ -13,9 +14,19 @@ import type {
   ServerMessage,
   Track,
 } from './src/types/room.ts';
+import { getProviderLabel, parseMediaUrl } from './src/utils/media.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const ENV_HOST_PASSWORD = (process.env.HOST_PASSWORD || '').trim();
+const ALLOWED_PROVIDERS = new Set<MediaProvider>([
+  'youtube',
+  'soundcloud',
+  'bilibili',
+  'twitch',
+  'spotify',
+  'apple_music',
+  'kkbox',
+]);
 
 interface ConnectedClient {
   ws: WebSocket;
@@ -48,6 +59,43 @@ const sharedRoom: ServerRoom = {
   },
   clients: new Map(),
 };
+
+function decodeHtmlEntities(str: string): string {
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .trim();
+}
+
+function extractOpenGraph(html: string): { title?: string; image?: string; siteName?: string } {
+  const getMeta = (attr: string, value: string): string | undefined => {
+    const regex1 = new RegExp(
+      `<meta[^>]+${attr}=["']${value}["'][^>]+content=["']([^"']+)["']`,
+      'i',
+    );
+    const regex2 = new RegExp(
+      `<meta[^>]+content=["']([^"']+)["'][^>]+${attr}=["']${value}["']`,
+      'i',
+    );
+    const match = html.match(regex1) || html.match(regex2);
+    return match?.[1] ? decodeHtmlEntities(match[1]) : undefined;
+  };
+
+  const titleTagMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+  const ogTitle = getMeta('property', 'og:title') || getMeta('name', 'twitter:title');
+  const ogImage = getMeta('property', 'og:image') || getMeta('name', 'twitter:image');
+  const ogSite = getMeta('property', 'og:site_name');
+
+  return {
+    title: ogTitle || (titleTagMatch?.[1] ? decodeHtmlEntities(titleTagMatch[1]) : undefined),
+    image: ogImage,
+    siteName: ogSite,
+  };
+}
 
 function getEffectivePosition(playback: PlaybackState, now = Date.now()): number {
   if (!playback.currentTrack) return 0;
@@ -85,10 +133,6 @@ function broadcastParticipants(room: ServerRoom) {
   }
 }
 
-/**
- * Advance to the next song in the persistent playlist without removing played songs.
- * When wrapOnEnd is false (e.g. automatic track end), stops cleanly after the final song.
- */
 function advanceToNextTrack(room: ServerRoom, wrapOnEnd = false) {
   const now = Date.now();
   if (room.queue.length === 0) {
@@ -130,17 +174,187 @@ function advanceToNextTrack(room: ServerRoom, wrapOnEnd = false) {
   }
 }
 
+async function resolveMediaMetadata(rawInput: string) {
+  let parsed = parseMediaUrl(rawInput);
+  if (!parsed) return null;
+
+  const headers = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    Accept: 'text/html,application/json;q=0.9,*/*;q=0.8',
+  };
+
+  // Resolve shortlinks (b23.tv, on.soundcloud.com, kkbox.fm)
+  let prefetchedHtml: string | null = null;
+  if (parsed.needsResolve) {
+    try {
+      const resp = await fetch(parsed.sourceUrl, {
+        redirect: 'follow',
+        headers,
+        signal: AbortSignal.timeout(4500),
+      });
+      const resolvedParsed = parseMediaUrl(resp.url);
+      if (resolvedParsed && !resolvedParsed.needsResolve) {
+        parsed = resolvedParsed;
+      } else {
+        prefetchedHtml = await resp.text();
+      }
+    } catch {
+      // Keep original parsed info
+    }
+  }
+
+  const label = getProviderLabel(parsed.provider);
+  const fallback = {
+    provider: parsed.provider,
+    mediaId: parsed.mediaId,
+    sourceUrl: parsed.sourceUrl,
+    title: `${label} 曲目`,
+    author: label,
+    thumbnailUrl:
+      parsed.provider === 'youtube'
+        ? `https://i.ytimg.com/vi/${parsed.mediaId}/hqdefault.jpg`
+        : '',
+  };
+
+  if (parsed.provider === 'youtube') {
+    try {
+      const target = `https://www.youtube.com/oembed?url=${encodeURIComponent(
+        parsed.sourceUrl,
+      )}&format=json`;
+      const r = await fetch(target, { signal: AbortSignal.timeout(4500) });
+      if (r.ok) {
+        const data = (await r.json()) as {
+          title?: string;
+          author_name?: string;
+          thumbnail_url?: string;
+        };
+        return {
+          ...fallback,
+          title: data.title || `YouTube 影片 (${parsed.mediaId})`,
+          author: data.author_name || 'YouTube',
+          thumbnailUrl: data.thumbnail_url || fallback.thumbnailUrl,
+        };
+      }
+    } catch {
+      // Fall through
+    }
+    return { ...fallback, title: `YouTube 影片 (${parsed.mediaId})` };
+  }
+
+  if (parsed.provider === 'soundcloud') {
+    try {
+      const target = `https://soundcloud.com/oembed?format=json&url=${encodeURIComponent(
+        parsed.sourceUrl,
+      )}`;
+      const r = await fetch(target, { signal: AbortSignal.timeout(4500) });
+      if (r.ok) {
+        const data = (await r.json()) as {
+          title?: string;
+          author_name?: string;
+          thumbnail_url?: string;
+        };
+        return {
+          ...fallback,
+          title: data.title || fallback.title,
+          author: data.author_name || 'SoundCloud',
+          thumbnailUrl: data.thumbnail_url || '',
+        };
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  if (parsed.provider === 'spotify') {
+    try {
+      const target = `https://open.spotify.com/oembed?url=${encodeURIComponent(parsed.sourceUrl)}`;
+      const r = await fetch(target, { signal: AbortSignal.timeout(4500) });
+      if (r.ok) {
+        const data = (await r.json()) as {
+          title?: string;
+          thumbnail_url?: string;
+        };
+        return {
+          ...fallback,
+          title: data.title || fallback.title,
+          author: 'Spotify',
+          thumbnailUrl: data.thumbnail_url || '',
+        };
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  if (parsed.provider === 'bilibili' && parsed.mediaId.startsWith('bvid:')) {
+    const bvid = parsed.mediaId.slice(5);
+    try {
+      const r = await fetch(
+        `https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`,
+        { headers, signal: AbortSignal.timeout(4500) },
+      );
+      if (r.ok) {
+        const json = (await r.json()) as {
+          code?: number;
+          data?: { title?: string; pic?: string; owner?: { name?: string } };
+        };
+        if (json.code === 0 && json.data) {
+          const pic = json.data.pic?.replace(/^http:\/\//, 'https://') || '';
+          return {
+            ...fallback,
+            title: json.data.title || `Bilibili (${bvid})`,
+            author: json.data.owner?.name || 'Bilibili',
+            thumbnailUrl: pic,
+          };
+        }
+      }
+    } catch {
+      // Fall through to OpenGraph
+    }
+  }
+
+  // OpenGraph fallback for Twitch, Apple Music, KKBOX, Bilibili, etc.
+  try {
+    const html =
+      prefetchedHtml ??
+      (await (
+        await fetch(parsed.sourceUrl, { headers, signal: AbortSignal.timeout(4500) })
+      ).text());
+    const og = extractOpenGraph(html);
+    if (og.title || og.image) {
+      return {
+        ...fallback,
+        title: og.title || fallback.title,
+        author: og.siteName || label,
+        thumbnailUrl: og.image?.replace(/^http:\/\//, 'https://') || '',
+      };
+    }
+  } catch {
+    // Ignore scrape timeout/block
+  }
+
+  if (parsed.provider === 'twitch') {
+    const [kind, id] = parsed.mediaId.split(':');
+    return {
+      ...fallback,
+      title: kind === 'channel' ? `${id} 的 Twitch 實況` : `Twitch 影片 (${id})`,
+      author: kind === 'channel' ? id : 'Twitch',
+    };
+  }
+
+  return fallback;
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json());
 
-  // Prevent search engines from indexing any route
   app.use((_req, res, next) => {
     res.setHeader('X-Robots-Tag', 'noindex, nofollow');
     next();
   });
 
-  // Shared room status for entry screen
   app.get('/api/room/status', (_req, res) => {
     res.json({
       participantCount: sharedRoom.clients.size,
@@ -148,7 +362,6 @@ async function startServer() {
     });
   });
 
-  // Verify or initialize host password to receive hostKey
   app.post('/api/room/host-auth', (req, res) => {
     const rawPassword = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
     if (!rawPassword) {
@@ -170,44 +383,21 @@ async function startServer() {
     res.json({ hostKey: sharedRoom.hostKey });
   });
 
-  // Fetch YouTube video title & channel via oEmbed safely on server
-  app.get('/api/youtube-meta', async (req, res) => {
-    const videoId = typeof req.query.videoId === 'string' ? req.query.videoId.trim() : '';
-    if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-      res.status(400).json({ error: 'Invalid YouTube video ID' });
+  // Multi-platform media metadata resolver
+  app.get('/api/media-meta', async (req, res) => {
+    const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+    if (!rawUrl) {
+      res.status(400).json({ error: '請提供有效的媒體網址' });
       return;
     }
 
-    const fallback = {
-      videoId,
-      title: `YouTube 影片 (${videoId})`,
-      author: 'YouTube',
-      thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-    };
-
-    try {
-      const target = `https://www.youtube.com/oembed?url=${encodeURIComponent(
-        `https://www.youtube.com/watch?v=${videoId}`,
-      )}&format=json`;
-      const response = await fetch(target, { signal: AbortSignal.timeout(4500) });
-      if (!response.ok) {
-        res.json(fallback);
-        return;
-      }
-      const data = (await response.json()) as {
-        title?: string;
-        author_name?: string;
-        thumbnail_url?: string;
-      };
-      res.json({
-        videoId,
-        title: data.title || fallback.title,
-        author: data.author_name || fallback.author,
-        thumbnailUrl: data.thumbnail_url || fallback.thumbnailUrl,
-      });
-    } catch {
-      res.json(fallback);
+    const meta = await resolveMediaMetadata(rawUrl);
+    if (!meta) {
+      res.status(400).json({ error: '尚未支援此網址格式' });
+      return;
     }
+
+    res.json(meta);
   });
 
   const server = http.createServer(app);
@@ -290,21 +480,26 @@ async function startServer() {
         }
 
         case 'track:add': {
-          const videoId = msg.track?.videoId?.trim();
-          if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
-            sendJson(ws, { type: 'error', code: 'INVALID_URL', message: '無效的 YouTube 影片連結' });
+          const provider = msg.track?.provider;
+          const mediaId = msg.track?.mediaId?.trim();
+          const sourceUrl = msg.track?.sourceUrl?.trim();
+          if (!provider || !ALLOWED_PROVIDERS.has(provider) || !mediaId || !sourceUrl) {
+            sendJson(ws, { type: 'error', code: 'INVALID_URL', message: '無效或不支援的媒體連結' });
             return;
           }
 
           const exists = room.queue.some((t) => t.id === msg.track.id);
           if (exists) return;
 
+          const label = getProviderLabel(provider);
           const newTrack: Track = {
             id: msg.track.id || generateToken(6),
-            videoId,
-            title: (msg.track.title || `YouTube 影片 (${videoId})`).slice(0, 140),
-            author: (msg.track.author || 'YouTube').slice(0, 80),
-            thumbnailUrl: msg.track.thumbnailUrl || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+            provider,
+            sourceUrl: sourceUrl.slice(0, 500),
+            mediaId: mediaId.slice(0, 300),
+            title: (msg.track.title || `${label} 曲目`).slice(0, 140),
+            author: (msg.track.author || label).slice(0, 80),
+            thumbnailUrl: (msg.track.thumbnailUrl || '').slice(0, 500),
             addedBy: clientEntry.participant.name,
             addedByRole: clientEntry.participant.role,
             addedAt: now,

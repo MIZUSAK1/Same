@@ -299,7 +299,15 @@ export function useListenRoom() {
 
   const addTrack = useCallback(
     (
-      track: { id: string; videoId: string; title: string; author: string; thumbnailUrl: string },
+      track: {
+        id: string;
+        provider: import('../types/room').MediaProvider;
+        sourceUrl: string;
+        mediaId: string;
+        title: string;
+        author: string;
+        thumbnailUrl: string;
+      },
       playImmediately = false,
     ) => {
       sendMessage({ type: 'track:add', track, playImmediately });

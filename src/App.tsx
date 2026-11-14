@@ -1,8 +1,9 @@
+import { useState } from 'react';
 import { AlertTriangle, Loader2, LogOut, Radio, X } from 'lucide-react';
 import { AddTrackBar } from './components/AddTrackBar';
 import { EntryScreen } from './components/EntryScreen';
+import { MediaStage } from './components/MediaStage';
 import { QueueAndMembersPanel } from './components/QueueAndMembersPanel';
-import { YouTubeStage } from './components/YouTubeStage';
 import { useListenRoom } from './hooks/useListenRoom';
 
 export default function App() {
@@ -35,6 +36,8 @@ export default function App() {
     renameSelf,
     requestSync,
   } = useListenRoom();
+
+  const [isPlayerExpanded, setIsPlayerExpanded] = useState(false);
 
   if (phase === 'checking') {
     return (
@@ -109,7 +112,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* Error Banner (Only shown when real error occurs) */}
+      {/* Error Banner */}
       {errorMessage && (
         <div role="alert" className="border-b border-[#F87171]/25 bg-[#2A1417]">
           <div className="mx-auto flex max-w-[1440px] items-center justify-between gap-4 px-4 py-3 text-xs text-[#FCA5A5] sm:px-6">
@@ -129,19 +132,21 @@ export default function App() {
         </div>
       )}
 
-      {/* YouTube URL Input Bar */}
+      {/* Multi-Platform URL Input Bar */}
       <AddTrackBar role={role} onAddTrack={addTrack} />
 
-      {/* Main 2-Column Listening Studio */}
+      {/* Main Listening Studio (Supports Theater Expand) */}
       <main className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-6 sm:px-6">
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start">
-          {/* Dominant Focal Anchor: YouTube Sync Player */}
-          <div className="lg:col-span-7 xl:col-span-8">
-            <YouTubeStage
+          {/* Dominant Focal Anchor: Multi-Platform Sync Player */}
+          <div className={isPlayerExpanded ? 'lg:col-span-12' : 'lg:col-span-7 xl:col-span-8'}>
+            <MediaStage
               role={role}
               playback={playback}
               serverTimeOffset={serverTimeOffset}
               queueLength={queue.length}
+              isExpanded={isPlayerExpanded}
+              onToggleExpand={() => setIsPlayerExpanded((prev) => !prev)}
               onPlay={play}
               onPause={pause}
               onSeek={seek}
@@ -152,8 +157,8 @@ export default function App() {
             />
           </div>
 
-          {/* Right Column: Persistent Playlist & Online Members */}
-          <div className="lg:col-span-5 xl:col-span-4">
+          {/* Persistent Playlist & Online Members */}
+          <div className={isPlayerExpanded ? 'lg:col-span-12' : 'lg:col-span-5 xl:col-span-4'}>
             <QueueAndMembersPanel
               role={role}
               participantId={participantId}

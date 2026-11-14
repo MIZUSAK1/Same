@@ -1,6 +1,7 @@
 import { type FormEvent, useState } from 'react';
 import { ListMusic, Music2, Play, Trash2, Users } from 'lucide-react';
 import type { Participant, Role, Track } from '../types/room';
+import { getProviderLabel } from '../utils/media';
 
 interface TrackThumbnailProps {
   src: string;
@@ -123,7 +124,7 @@ export function QueueAndMembersPanel({
               <ListMusic className="h-7 w-7 text-[#6B7280]" />
               <p className="mt-3 text-sm font-medium text-[#F3F4F6]">播放清單目前是空的</p>
               <p className="mt-1 max-w-xs text-xs text-[#9CA3AF]">
-                在上方貼上 YouTube 連結即可加入歌曲。播過的歌曲會保留在清單中，並自動接續播放下一首。
+                在上方貼上支援的平台連結即可加入歌曲。播過的歌曲會保留在清單中，除非手動刪除。
               </p>
             </div>
           ) : (
@@ -164,7 +165,7 @@ export function QueueAndMembersPanel({
                       <p className="mt-0.5 truncate text-xs text-[#9CA3AF]">
                         <span className="text-[#D1D5DB]">點歌：{track.addedBy}</span>
                         <span aria-hidden="true"> · </span>
-                        <span>{track.author}</span>
+                        <span>{getProviderLabel(track.provider)}</span>
                         {isCurrent && (
                           <>
                             <span aria-hidden="true"> · </span>

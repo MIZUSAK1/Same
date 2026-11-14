@@ -1,8 +1,19 @@
 export type Role = 'host' | 'friend';
 
+export type MediaProvider =
+  | 'youtube'
+  | 'soundcloud'
+  | 'bilibili'
+  | 'twitch'
+  | 'spotify'
+  | 'apple_music'
+  | 'kkbox';
+
 export interface Track {
   id: string;
-  videoId: string;
+  provider: MediaProvider;
+  sourceUrl: string;
+  mediaId: string;
   title: string;
   author: string;
   thumbnailUrl: string;
@@ -41,7 +52,19 @@ export interface RoomStatusResponse {
 }
 
 export type ClientMessage =
-  | { type: 'track:add'; track: { id: string; videoId: string; title: string; author: string; thumbnailUrl: string }; playImmediately?: boolean }
+  | {
+      type: 'track:add';
+      track: {
+        id: string;
+        provider: MediaProvider;
+        sourceUrl: string;
+        mediaId: string;
+        title: string;
+        author: string;
+        thumbnailUrl: string;
+      };
+      playImmediately?: boolean;
+    }
   | { type: 'track:switch'; trackId: string }
   | { type: 'track:remove'; trackId: string }
   | { type: 'queue:clear' }
