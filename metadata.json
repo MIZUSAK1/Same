@@ -1,0 +1,6 @@
+{
+  "name": "私密點歌室",
+  "description": "僅限房主與 2–3 位好友透過 YouTube 連結同步聽歌的私密點歌空間，房主可切換與控制播放，好友僅可加入待播歌曲。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
