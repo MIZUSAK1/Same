@@ -1,4 +1,4 @@
-import { AlertTriangle, Loader2, Radio, X } from 'lucide-react';
+import { AlertTriangle, Loader2, LogOut, Radio, X } from 'lucide-react';
 import { AddTrackBar } from './components/AddTrackBar';
 import { EntryScreen } from './components/EntryScreen';
 import { QueueAndMembersPanel } from './components/QueueAndMembersPanel';
@@ -8,10 +8,8 @@ import { useListenRoom } from './hooks/useListenRoom';
 export default function App() {
   const {
     phase,
-    pendingRoomId,
-    roomPreview,
+    roomStatus,
     isEntering,
-    roomId,
     role,
     participantId,
     participants,
@@ -21,7 +19,9 @@ export default function App() {
     connectionStatus,
     errorMessage,
     clearError,
-    enterRoom,
+    enterAsFriend,
+    enterAsHost,
+    returnToEntry,
     addTrack,
     switchTrack,
     removeTrack,
@@ -34,7 +34,6 @@ export default function App() {
     notifyEnded,
     renameSelf,
     requestSync,
-    createOwnRoom,
   } = useListenRoom();
 
   if (phase === 'checking') {
@@ -48,14 +47,14 @@ export default function App() {
     );
   }
 
-  if (phase === 'entry' || (phase === 'error' && !roomId)) {
+  if (phase === 'entry') {
     return (
       <EntryScreen
-        pendingRoomId={pendingRoomId}
-        roomPreview={roomPreview}
+        roomStatus={roomStatus}
         isEntering={isEntering}
         errorMessage={errorMessage}
-        onEnter={(nickname) => void enterRoom(nickname)}
+        onEnterAsFriend={(nickname) => void enterAsFriend(nickname)}
+        onEnterAsHost={(nickname, password) => void enterAsHost(nickname, password)}
       />
     );
   }
@@ -73,13 +72,10 @@ export default function App() {
     <div className="min-h-screen bg-[#0D0E11] text-[#F3F4F6] flex flex-col">
       {/* Top Bar */}
       <header className="border-b border-white/8 bg-[#0D0E11]">
-        <div className="mx-auto flex max-w-[1440px] items-center justify-between gap-8 px-4 py-3.5 sm:px-6">
-          <a
-            href="/"
-            className="text-base font-bold tracking-tight text-[#F3F4F6] whitespace-nowrap shrink-0"
-          >
+        <div className="mx-auto flex max-w-[1440px] items-center justify-between gap-6 px-4 py-3.5 sm:px-6">
+          <span className="text-base font-bold tracking-tight text-[#F3F4F6] whitespace-nowrap shrink-0">
             私密點歌室
-          </a>
+          </span>
 
           <div className="flex items-center gap-4 text-xs text-[#9CA3AF]">
             <span className="inline-flex items-center gap-1.5 whitespace-nowrap shrink-0">
@@ -100,6 +96,15 @@ export default function App() {
             <span className="font-mono tabular-nums whitespace-nowrap shrink-0">
               在線 {participants.length} 人
             </span>
+            <button
+              type="button"
+              onClick={() => void returnToEntry()}
+              title="切換身分或重新登入"
+              className="inline-flex items-center gap-1 text-xs text-[#9CA3AF] transition-colors hover:text-[#F3F4F6] whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              <span className="hidden md:inline">切換身分</span>
+            </button>
           </div>
         </div>
       </header>
@@ -112,25 +117,14 @@ export default function App() {
               <AlertTriangle className="h-4 w-4 shrink-0 text-[#F87171]" />
               <span>{errorMessage}</span>
             </div>
-            <div className="flex items-center gap-3 shrink-0">
-              {connectionStatus === 'error' && (
-                <button
-                  type="button"
-                  onClick={() => void createOwnRoom()}
-                  className="font-medium text-[#F3F4F6] underline underline-offset-2 hover:text-[#E59F3C] whitespace-nowrap cursor-pointer"
-                >
-                  建立新房間
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={clearError}
-                aria-label="關閉提示"
-                className="rounded p-1 hover:bg-white/10 cursor-pointer"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={clearError}
+              aria-label="關閉提示"
+              className="rounded p-1 hover:bg-white/10 cursor-pointer"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
           </div>
         </div>
       )}

@@ -5,6 +5,7 @@ import type {
   PlaybackState,
   Role,
   RoomSnapshot,
+  RoomStatusResponse,
   ServerMessage,
   Track,
 } from '../types/room';
@@ -12,30 +13,12 @@ import type {
 export type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'error';
 export type RoomPhase = 'checking' | 'entry' | 'joined' | 'error';
 
-const HOST_KEYS_STORAGE = 'private_listen_room_host_keys_v1';
 const USER_NAME_STORAGE = 'private_listen_room_display_name_v1';
-const SESSION_ENTERED_ROOM = 'private_listen_room_entered_room_v1';
+const SESSION_AUTH_STORAGE = 'private_listen_room_session_v2';
 
-function loadHostKey(roomId: string): string {
-  try {
-    const raw = localStorage.getItem(HOST_KEYS_STORAGE);
-    if (!raw) return '';
-    const map = JSON.parse(raw) as Record<string, string>;
-    return map[roomId] || '';
-  } catch {
-    return '';
-  }
-}
-
-function saveHostKey(roomId: string, hostKey: string) {
-  try {
-    const raw = localStorage.getItem(HOST_KEYS_STORAGE);
-    const map = raw ? (JSON.parse(raw) as Record<string, string>) : {};
-    map[roomId] = hostKey;
-    localStorage.setItem(HOST_KEYS_STORAGE, JSON.stringify(map));
-  } catch {
-    // Ignore storage errors in restricted environments
-  }
+interface SessionAuth {
+  name: string;
+  hostKey: string;
 }
 
 export function loadSavedDisplayName(): string {
@@ -54,34 +37,42 @@ export function saveDisplayName(name: string) {
   }
 }
 
-function getSessionEnteredRoom(): string {
+function loadSessionAuth(): SessionAuth | null {
   try {
-    return sessionStorage.getItem(SESSION_ENTERED_ROOM) || '';
+    const raw = sessionStorage.getItem(SESSION_AUTH_STORAGE);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SessionAuth>;
+    if (typeof parsed.name === 'string' && parsed.name.trim()) {
+      return { name: parsed.name, hostKey: typeof parsed.hostKey === 'string' ? parsed.hostKey : '' };
+    }
+    return null;
   } catch {
-    return '';
+    return null;
   }
 }
 
-function setSessionEnteredRoom(roomId: string) {
+function saveSessionAuth(session: SessionAuth) {
   try {
-    sessionStorage.setItem(SESSION_ENTERED_ROOM, roomId);
+    sessionStorage.setItem(SESSION_AUTH_STORAGE, JSON.stringify(session));
   } catch {
     // Ignore storage errors
   }
 }
 
-export interface RoomPreviewStatus {
-  exists: boolean;
-  participantCount: number;
+function clearSessionAuth() {
+  try {
+    sessionStorage.removeItem(SESSION_AUTH_STORAGE);
+  } catch {
+    // Ignore storage errors
+  }
 }
 
 export function useListenRoom() {
   const [phase, setPhase] = useState<RoomPhase>('checking');
-  const [pendingRoomId, setPendingRoomId] = useState<string | null>(null);
-  const [roomPreview, setRoomPreview] = useState<RoomPreviewStatus | null>(null);
+  const [roomStatus, setRoomStatus] = useState<RoomStatusResponse | null>(null);
   const [isEntering, setIsEntering] = useState(false);
 
-  const [roomId, setRoomId] = useState<string | null>(null);
+  const [roomId, setRoomId] = useState<string>('main');
   const [role, setRole] = useState<Role>('friend');
   const [participantId, setParticipantId] = useState<string>('');
   const [participants, setParticipants] = useState<Participant[]>([]);
@@ -98,29 +89,14 @@ export function useListenRoom() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
-  const activeRoomRef = useRef<{ roomId: string; hostKey: string; name: string } | null>(null);
+  const activeSessionRef = useRef<SessionAuth | null>(null);
   const disposedRef = useRef(false);
 
   const clearError = useCallback(() => {
     setErrorMessage(null);
   }, []);
 
-  const createAndEnterRoom = useCallback(async () => {
-    const res = await fetch('/api/rooms', { method: 'POST' });
-    if (!res.ok) {
-      throw new Error('無法建立私密房間');
-    }
-    const data = (await res.json()) as {
-      roomId: string;
-      hostKey: string;
-    };
-    saveHostKey(data.roomId, data.hostKey);
-    const nextUrl = `${window.location.pathname}?room=${encodeURIComponent(data.roomId)}`;
-    window.history.replaceState(null, '', nextUrl);
-    return { roomId: data.roomId, hostKey: data.hostKey };
-  }, []);
-
-  const connectSocket = useCallback((targetRoomId: string, targetHostKey: string, displayName: string) => {
+  const connectSocket = useCallback((displayName: string, hostKey: string) => {
     if (disposedRef.current) return;
     if (wsRef.current) {
       wsRef.current.onclose = null;
@@ -131,9 +107,8 @@ export function useListenRoom() {
     setConnectionStatus('connecting');
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const params = new URLSearchParams({
-      roomId: targetRoomId,
       name: displayName,
-      ...(targetHostKey ? { hostKey: targetHostKey } : {}),
+      ...(hostKey ? { hostKey } : {}),
     });
 
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws?${params.toString()}`);
@@ -161,7 +136,7 @@ export function useListenRoom() {
         setParticipants(snap.participants);
         setQueue(snap.queue);
         setPlayback(snap.playback);
-        setServerTimeOffset(msg.snapshot.serverTime - Date.now());
+        setServerTimeOffset(snap.serverTime - Date.now());
         setErrorMessage(null);
         setConnectionStatus('connected');
         setPhase('joined');
@@ -173,10 +148,6 @@ export function useListenRoom() {
         setParticipants(msg.participants);
       } else if (msg.type === 'error') {
         setErrorMessage(msg.message);
-        if (msg.code === 'ROOM_NOT_FOUND' || msg.code === 'ROOM_FULL') {
-          setConnectionStatus('error');
-          setPhase('error');
-        }
       }
     };
 
@@ -186,9 +157,9 @@ export function useListenRoom() {
       setConnectionStatus((prev) => (prev === 'error' ? 'error' : 'reconnecting'));
       if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = window.setTimeout(() => {
-        const current = activeRoomRef.current;
+        const current = activeSessionRef.current;
         if (current && !disposedRef.current) {
-          connectSocket(current.roomId, current.hostKey, current.name);
+          connectSocket(current.name, current.hostKey);
         }
       }, 2000);
     };
@@ -198,57 +169,30 @@ export function useListenRoom() {
     disposedRef.current = false;
 
     async function bootstrap() {
-      const search = new URLSearchParams(window.location.search);
-      const urlRoomId = search.get('room')?.trim() || '';
-      const savedName = loadSavedDisplayName().trim();
-      const sessionRoom = getSessionEnteredRoom();
+      // Normalize any legacy ?room=... query string quietly
+      if (window.location.search) {
+        window.history.replaceState(null, '', window.location.pathname);
+      }
 
       try {
-        if (urlRoomId) {
-          const statusRes = await fetch(`/api/rooms/${encodeURIComponent(urlRoomId)}/status`);
-          const storedHostKey = loadHostKey(urlRoomId);
+        const statusRes = await fetch('/api/room/status');
+        if (statusRes.ok) {
+          const status = (await statusRes.json()) as RoomStatusResponse;
+          setRoomStatus(status);
+        }
 
-          if (statusRes.ok) {
-            const status = (await statusRes.json()) as RoomPreviewStatus;
-            setPendingRoomId(urlRoomId);
-            setRoomPreview(status);
-
-            // Auto-rejoin only if user already entered this room in the current tab session
-            if (sessionRoom === urlRoomId && savedName) {
-              activeRoomRef.current = { roomId: urlRoomId, hostKey: storedHostKey, name: savedName };
-              setRoomId(urlRoomId);
-              setPhase('joined');
-              connectSocket(urlRoomId, storedHostKey, savedName);
-              return;
-            }
-
-            setPhase('entry');
-            return;
-          }
-
-          if (storedHostKey) {
-            // Host's previous room expired after server restart: prompt to create fresh room
-            window.history.replaceState(null, '', window.location.pathname);
-            setPendingRoomId(null);
-            setRoomPreview(null);
-            setPhase('entry');
-            return;
-          }
-
-          setErrorMessage('找不到這個私密點歌室，可能房間已關閉或連結有誤。');
-          setConnectionStatus('error');
-          setPhase('error');
+        const session = loadSessionAuth();
+        if (session) {
+          activeSessionRef.current = session;
+          setPhase('joined');
+          connectSocket(session.name, session.hostKey);
           return;
         }
 
-        // No room query param: Host entry to create a new private room
-        setPendingRoomId(null);
-        setRoomPreview(null);
         setPhase('entry');
       } catch {
         setErrorMessage('連線至伺服器時發生問題，請重新整理頁面再試一次。');
-        setConnectionStatus('error');
-        setPhase('error');
+        setPhase('entry');
       }
     }
 
@@ -264,7 +208,7 @@ export function useListenRoom() {
     };
   }, [connectSocket]);
 
-  const enterRoom = useCallback(
+  const enterAsFriend = useCallback(
     async (nickname: string) => {
       const cleanName = nickname.trim().slice(0, 24);
       if (!cleanName || isEntering) return;
@@ -273,31 +217,76 @@ export function useListenRoom() {
       setErrorMessage(null);
       saveDisplayName(cleanName);
 
+      const session: SessionAuth = { name: cleanName, hostKey: '' };
+      saveSessionAuth(session);
+      activeSessionRef.current = session;
+      setPhase('joined');
+      connectSocket(cleanName, '');
+      setIsEntering(false);
+    },
+    [connectSocket, isEntering],
+  );
+
+  const enterAsHost = useCallback(
+    async (nickname: string, password: string) => {
+      const cleanName = nickname.trim().slice(0, 24);
+      const cleanPassword = password.trim();
+      if (!cleanName || !cleanPassword || isEntering) return;
+
+      setIsEntering(true);
+      setErrorMessage(null);
+
       try {
-        if (pendingRoomId) {
-          const hostKey = loadHostKey(pendingRoomId);
-          setSessionEnteredRoom(pendingRoomId);
-          activeRoomRef.current = { roomId: pendingRoomId, hostKey, name: cleanName };
-          setRoomId(pendingRoomId);
-          setPhase('joined');
-          connectSocket(pendingRoomId, hostKey, cleanName);
-        } else {
-          const fresh = await createAndEnterRoom();
-          setSessionEnteredRoom(fresh.roomId);
-          activeRoomRef.current = { roomId: fresh.roomId, hostKey: fresh.hostKey, name: cleanName };
-          setRoomId(fresh.roomId);
-          setPhase('joined');
-          connectSocket(fresh.roomId, fresh.hostKey, cleanName);
+        const res = await fetch('/api/room/host-auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: cleanPassword }),
+        });
+
+        const data = (await res.json()) as { hostKey?: string; error?: string };
+        if (!res.ok || !data.hostKey) {
+          setErrorMessage(data.error || '房主密碼驗證失敗');
+          // Refresh roomStatus so UI reflects if host password is already set
+          try {
+            const st = await fetch('/api/room/status');
+            if (st.ok) setRoomStatus((await st.json()) as RoomStatusResponse);
+          } catch {
+            // Ignore
+          }
+          return;
         }
+
+        saveDisplayName(cleanName);
+        const session: SessionAuth = { name: cleanName, hostKey: data.hostKey };
+        saveSessionAuth(session);
+        activeSessionRef.current = session;
+        setPhase('joined');
+        connectSocket(cleanName, data.hostKey);
       } catch {
-        setErrorMessage('進入房間失敗，請稍後再試一次。');
-        setPhase('entry');
+        setErrorMessage('無法連線至伺服器驗證房主身份，請稍後再試。');
       } finally {
         setIsEntering(false);
       }
     },
-    [connectSocket, createAndEnterRoom, isEntering, pendingRoomId],
+    [connectSocket, isEntering],
   );
+
+  const returnToEntry = useCallback(async () => {
+    clearSessionAuth();
+    activeSessionRef.current = null;
+    if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    try {
+      const st = await fetch('/api/room/status');
+      if (st.ok) setRoomStatus((await st.json()) as RoomStatusResponse);
+    } catch {
+      // Ignore
+    }
+    setPhase('entry');
+  }, []);
 
   const sendMessage = useCallback((message: ClientMessage) => {
     const ws = wsRef.current;
@@ -358,8 +347,9 @@ export function useListenRoom() {
       const trimmed = name.trim().slice(0, 24);
       if (!trimmed) return;
       saveDisplayName(trimmed);
-      if (activeRoomRef.current) {
-        activeRoomRef.current.name = trimmed;
+      if (activeSessionRef.current) {
+        activeSessionRef.current.name = trimmed;
+        saveSessionAuth(activeSessionRef.current);
       }
       sendMessage({ type: 'participant:rename', name: trimmed });
     },
@@ -368,18 +358,9 @@ export function useListenRoom() {
 
   const requestSync = useCallback(() => sendMessage({ type: 'sync:request' }), [sendMessage]);
 
-  const handleCreateOwnRoom = useCallback(async () => {
-    window.history.replaceState(null, '', window.location.pathname);
-    setPendingRoomId(null);
-    setRoomPreview(null);
-    setErrorMessage(null);
-    setPhase('entry');
-  }, []);
-
   return {
     phase,
-    pendingRoomId,
-    roomPreview,
+    roomStatus,
     isEntering,
     roomId,
     role,
@@ -391,7 +372,9 @@ export function useListenRoom() {
     connectionStatus,
     errorMessage,
     clearError,
-    enterRoom,
+    enterAsFriend,
+    enterAsHost,
+    returnToEntry,
     addTrack,
     switchTrack,
     removeTrack,
@@ -404,6 +387,5 @@ export function useListenRoom() {
     notifyEnded,
     renameSelf,
     requestSync,
-    createOwnRoom: handleCreateOwnRoom,
   };
 }

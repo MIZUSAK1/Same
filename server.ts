@@ -15,6 +15,7 @@ import type {
 } from './src/types/room.ts';
 
 const PORT = Number(process.env.PORT || 3000);
+const ENV_HOST_PASSWORD = (process.env.HOST_PASSWORD || '').trim();
 
 interface ConnectedClient {
   ws: WebSocket;
@@ -24,43 +25,35 @@ interface ConnectedClient {
 interface ServerRoom {
   roomId: string;
   hostKey: string;
-  createdAt: number;
+  hostPassword: string | null;
   queue: Track[];
   playback: PlaybackState;
   clients: Map<string, ConnectedClient>;
 }
 
-const rooms = new Map<string, ServerRoom>();
-
-function generateToken(bytes = 8): string {
+function generateToken(bytes = 12): string {
   return crypto.randomBytes(bytes).toString('base64url');
 }
+
+const sharedRoom: ServerRoom = {
+  roomId: 'main',
+  hostKey: generateToken(18),
+  hostPassword: ENV_HOST_PASSWORD || null,
+  queue: [],
+  playback: {
+    currentTrack: null,
+    isPlaying: false,
+    positionSeconds: 0,
+    updatedAt: Date.now(),
+  },
+  clients: new Map(),
+};
 
 function getEffectivePosition(playback: PlaybackState, now = Date.now()): number {
   if (!playback.currentTrack) return 0;
   if (!playback.isPlaying) return playback.positionSeconds;
   const elapsed = Math.max(0, (now - playback.updatedAt) / 1000);
   return playback.positionSeconds + elapsed;
-}
-
-function createRoom(): ServerRoom {
-  const roomId = generateToken(7);
-  const hostKey = generateToken(18);
-  const room: ServerRoom = {
-    roomId,
-    hostKey,
-    createdAt: Date.now(),
-    queue: [],
-    playback: {
-      currentTrack: null,
-      isPlaying: false,
-      positionSeconds: 0,
-      updatedAt: Date.now(),
-    },
-    clients: new Map(),
-  };
-  rooms.set(roomId, room);
-  return room;
 }
 
 function sendJson(ws: WebSocket, payload: ServerMessage) {
@@ -128,7 +121,6 @@ function advanceToNextTrack(room: ServerRoom, wrapOnEnd = false) {
       updatedAt: now,
     };
   } else {
-    // Reached end of playlist: keep currentTrack loaded but paused at 0
     room.playback = {
       currentTrack: room.playback.currentTrack,
       isPlaying: false,
@@ -148,26 +140,34 @@ async function startServer() {
     next();
   });
 
-  // Create a new unlisted private room (never publicly listed anywhere)
-  app.post('/api/rooms', (_req, res) => {
-    const room = createRoom();
-    res.status(201).json({
-      roomId: room.roomId,
-      hostKey: room.hostKey,
+  // Shared room status for entry screen
+  app.get('/api/room/status', (_req, res) => {
+    res.json({
+      participantCount: sharedRoom.clients.size,
+      hasHostPassword: Boolean(sharedRoom.hostPassword),
     });
   });
 
-  // Check if a private room exists without exposing any other rooms
-  app.get('/api/rooms/:roomId/status', (req, res) => {
-    const room = rooms.get(req.params.roomId);
-    if (!room) {
-      res.status(404).json({ exists: false });
+  // Verify or initialize host password to receive hostKey
+  app.post('/api/room/host-auth', (req, res) => {
+    const rawPassword = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
+    if (!rawPassword) {
+      res.status(400).json({ error: '請輸入房主密碼' });
       return;
     }
-    res.json({
-      exists: true,
-      participantCount: room.clients.size,
-    });
+
+    if (!sharedRoom.hostPassword) {
+      sharedRoom.hostPassword = rawPassword;
+      res.json({ hostKey: sharedRoom.hostKey });
+      return;
+    }
+
+    if (rawPassword !== sharedRoom.hostPassword) {
+      res.status(401).json({ error: '房主密碼不正確，請重新輸入或以朋友身份加入。' });
+      return;
+    }
+
+    res.json({ hostKey: sharedRoom.hostKey });
   });
 
   // Fetch YouTube video title & channel via oEmbed safely on server
@@ -215,21 +215,10 @@ async function startServer() {
 
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-    const roomId = url.searchParams.get('roomId') || '';
     const hostKey = url.searchParams.get('hostKey') || '';
     const rawName = (url.searchParams.get('name') || '').trim().slice(0, 24);
 
-    const room = rooms.get(roomId);
-    if (!room) {
-      sendJson(ws, {
-        type: 'error',
-        code: 'ROOM_NOT_FOUND',
-        message: '找不到這個私密點歌室，請向房主確認邀請連結或重新建立房間。',
-      });
-      ws.close();
-      return;
-    }
-
+    const room = sharedRoom;
     const role: Role = hostKey && hostKey === room.hostKey ? 'host' : 'friend';
 
     const participantId = generateToken(6);
@@ -307,7 +296,6 @@ async function startServer() {
             return;
           }
 
-          // Idempotent guard
           const exists = room.queue.some((t) => t.id === msg.track.id);
           if (exists) return;
 
@@ -331,7 +319,6 @@ async function startServer() {
             return;
           }
 
-          // Always keep added track in the persistent playlist unless manually deleted
           room.queue.push(newTrack);
 
           if (msg.playImmediately || (!room.playback.currentTrack && isHost)) {

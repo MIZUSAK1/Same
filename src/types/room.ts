@@ -35,6 +35,11 @@ export interface RoomSnapshot {
   serverTime: number;
 }
 
+export interface RoomStatusResponse {
+  participantCount: number;
+  hasHostPassword: boolean;
+}
+
 export type ClientMessage =
   | { type: 'track:add'; track: { id: string; videoId: string; title: string; author: string; thumbnailUrl: string }; playImmediately?: boolean }
   | { type: 'track:switch'; trackId: string }
