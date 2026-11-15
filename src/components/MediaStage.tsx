@@ -74,6 +74,8 @@ interface SCWidgetInstance {
   getPosition: (callback: (ms: number) => void) => void;
   getDuration: (callback: (ms: number) => void) => void;
   isPaused: (callback: (paused: boolean) => void) => void;
+  getSounds: (callback: (sounds: unknown[]) => void) => void;
+  getCurrentSoundIndex: (callback: (index: number) => void) => void;
 }
 
 interface SCNamespace {
@@ -253,6 +255,10 @@ export function MediaStage({
   const scIframeRef = useRef<HTMLIFrameElement | null>(null);
   const scWidgetRef = useRef<SCWidgetInstance | null>(null);
   const scReadyRef = useRef(false);
+  const scSoundCountRef = useRef(1);
+  const scCurrentIndexRef = useRef(0);
+  const scLastPosMsRef = useRef(0);
+  const scPlaylistTransitionUntilRef = useRef(0);
 
   const twitchContainerRef = useRef<HTMLDivElement | null>(null);
   const twitchPlayerRef = useRef<TwitchPlayerInstance | null>(null);
@@ -261,6 +267,12 @@ export function MediaStage({
   const isRemoteSyncRef = useRef(false);
   const remoteSyncTimerRef = useRef<number | null>(null);
   const endedDispatchedTrackIdRef = useRef<string | null>(null);
+  const lastSyncedPlaybackRef = useRef<{
+    trackId: string | null;
+    isPlaying: boolean;
+    positionSeconds: number;
+    updatedAt: number;
+  } | null>(null);
 
   const [localTime, setLocalTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -496,11 +508,19 @@ export function MediaStage({
     if (provider !== 'soundcloud' || !currentTrack) {
       scWidgetRef.current = null;
       scReadyRef.current = false;
+      scSoundCountRef.current = 1;
+      scCurrentIndexRef.current = 0;
+      scLastPosMsRef.current = 0;
+      scPlaylistTransitionUntilRef.current = 0;
       return;
     }
 
     let cancelled = false;
     scReadyRef.current = false;
+    scSoundCountRef.current = currentTrack.sourceUrl.includes('/sets/') ? 2 : 1;
+    scCurrentIndexRef.current = 0;
+    scLastPosMsRef.current = 0;
+    scPlaylistTransitionUntilRef.current = 0;
     setPlayerError(null);
     setAutoplayBlocked(false);
     setLocalTime(0);
@@ -518,11 +538,22 @@ export function MediaStage({
           const { playback: pb, serverTimeOffset: offset, volume: vol, isMuted: muted } =
             latestPropsRef.current;
           widget.setVolume(muted ? 0 : vol);
+          widget.getSounds((sounds) => {
+            if (!cancelled && Array.isArray(sounds) && sounds.length > 0) {
+              scSoundCountRef.current = sounds.length;
+            }
+          });
+          widget.getCurrentSoundIndex((idx) => {
+            if (!cancelled && typeof idx === 'number') {
+              scCurrentIndexRef.current = idx;
+            }
+          });
           widget.getDuration((ms) => {
             if (!cancelled && ms > 0) setDuration(ms / 1000);
           });
           if (pb.currentTrack && pb.currentTrack.id === currentTrack.id) {
-            const targetPos = getAuthoritativePosition(pb, offset);
+            const isSet = currentTrack.sourceUrl.includes('/sets/');
+            const targetPos = isSet ? pb.positionSeconds : getAuthoritativePosition(pb, offset);
             markRemoteSync(1500);
             if (targetPos > 0.5) widget.seekTo(targetPos * 1000);
             if (pb.isPlaying) widget.play();
@@ -544,13 +575,29 @@ export function MediaStage({
             }
           }, 150);
 
-          if (!isRemoteSyncRef.current && hostMode && pb.currentTrack && !pb.isPlaying) {
+          widget.getCurrentSoundIndex((idx) => {
+            if (!cancelled && typeof idx === 'number') {
+              scCurrentIndexRef.current = idx;
+            }
+          });
+          widget.getDuration((ms) => {
+            if (!cancelled && ms > 0) setDuration(ms / 1000);
+          });
+
+          if (
+            !isRemoteSyncRef.current &&
+            Date.now() >= scPlaylistTransitionUntilRef.current &&
+            hostMode &&
+            pb.currentTrack &&
+            !pb.isPlaying
+          ) {
             widget.getPosition((ms) => emitPlay(ms / 1000));
           }
         });
 
         widget.bind(SC.Widget.Events.PAUSE, () => {
           if (cancelled) return;
+          if (Date.now() < scPlaylistTransitionUntilRef.current) return;
           const { isHost: hostMode, playback: pb, onPause: emitPause } = latestPropsRef.current;
           if (
             !isRemoteSyncRef.current &&
@@ -559,21 +606,86 @@ export function MediaStage({
             pb.isPlaying &&
             !document.hidden
           ) {
-            widget.getPosition((ms) => emitPause(ms / 1000));
+            widget.getPosition((ms) => {
+              if (cancelled) return;
+              if (isRemoteSyncRef.current || Date.now() < scPlaylistTransitionUntilRef.current) {
+                return;
+              }
+              widget.getDuration((durMs) => {
+                if (cancelled) return;
+                const nearEnd = durMs > 0 && ms >= durMs - 1500;
+                const jumpedToStartOnPlaylist =
+                  scSoundCountRef.current > 1 && ms <= 500 && scLastPosMsRef.current > 2000;
+                if (nearEnd || jumpedToStartOnPlaylist) {
+                  return;
+                }
+                emitPause(ms / 1000);
+              });
+            });
           }
         });
 
         widget.bind(SC.Widget.Events.FINISH, () => {
           if (cancelled) return;
           const { isHost: hostMode, playback: pb, onTrackEnded: emitEnded } = latestPropsRef.current;
-          if (
-            hostMode &&
-            pb.currentTrack &&
-            endedDispatchedTrackIdRef.current !== pb.currentTrack.id
-          ) {
-            endedDispatchedTrackIdRef.current = pb.currentTrack.id;
-            emitEnded(pb.currentTrack.id);
-          }
+          if (!pb.currentTrack) return;
+
+          const prevIdx = scCurrentIndexRef.current;
+          const knownCount = scSoundCountRef.current;
+
+          widget.getSounds((sounds) => {
+            if (cancelled) return;
+            const total = Array.isArray(sounds) && sounds.length > 0 ? sounds.length : knownCount;
+            scSoundCountRef.current = total;
+
+            widget.getCurrentSoundIndex((currentIdx) => {
+              if (cancelled) return;
+              const isPlaylist = total > 1;
+              const hasMoreInPlaylist =
+                isPlaylist && (prevIdx < total - 1 || currentIdx < total - 1);
+
+              if (hasMoreInPlaylist) {
+                scPlaylistTransitionUntilRef.current = Date.now() + 2500;
+                scLastPosMsRef.current = 0;
+                markRemoteSync(2500);
+
+                const ensurePlaylistContinues = () => {
+                  if (cancelled || scWidgetRef.current !== widget) return;
+                  widget.getCurrentSoundIndex((nextIdx) => {
+                    if (!cancelled && typeof nextIdx === 'number') {
+                      scCurrentIndexRef.current = nextIdx;
+                    }
+                  });
+                  widget.getDuration((ms) => {
+                    if (!cancelled && ms > 0) setDuration(ms / 1000);
+                  });
+                  if (latestPropsRef.current.playback.isPlaying) {
+                    widget.isPaused((paused) => {
+                      if (!cancelled && paused && scWidgetRef.current === widget) {
+                        widget.setVolume(
+                          latestPropsRef.current.isMuted ? 0 : latestPropsRef.current.volume,
+                        );
+                        widget.play();
+                      }
+                    });
+                  }
+                };
+
+                window.setTimeout(ensurePlaylistContinues, 300);
+                window.setTimeout(ensurePlaylistContinues, 800);
+                return;
+              }
+
+              if (
+                hostMode &&
+                pb.currentTrack &&
+                endedDispatchedTrackIdRef.current !== pb.currentTrack.id
+              ) {
+                endedDispatchedTrackIdRef.current = pb.currentTrack.id;
+                emitEnded(pb.currentTrack.id);
+              }
+            });
+          });
         });
       })
       .catch(() => {
@@ -706,6 +818,23 @@ export function MediaStage({
   // --- Sync Authoritative State to Active SDK Player ---
   useEffect(() => {
     const track = playback.currentTrack;
+    const prevSynced = lastSyncedPlaybackRef.current;
+    if (
+      prevSynced &&
+      prevSynced.trackId === (track?.id ?? null) &&
+      prevSynced.isPlaying === playback.isPlaying &&
+      prevSynced.positionSeconds === playback.positionSeconds &&
+      prevSynced.updatedAt === playback.updatedAt
+    ) {
+      return;
+    }
+    lastSyncedPlaybackRef.current = {
+      trackId: track?.id ?? null,
+      isPlaying: playback.isPlaying,
+      positionSeconds: playback.positionSeconds,
+      updatedAt: playback.updatedAt,
+    };
+
     if (!track) {
       setLocalTime(0);
       setDuration(0);
@@ -767,16 +896,27 @@ export function MediaStage({
     if (track.provider === 'soundcloud' && scWidgetRef.current && scReadyRef.current) {
       const widget = scWidgetRef.current;
       const { volume: vol, isMuted: muted } = latestPropsRef.current;
+      const isPlaylist = scSoundCountRef.current > 1 || track.sourceUrl.includes('/sets/');
       markRemoteSync(1500);
       widget.setVolume(muted ? 0 : vol);
-      widget.getPosition((ms) => {
-        const curSec = ms / 1000;
-        if (Math.abs(curSec - targetPos) > 2.2) {
-          markRemoteSync(1500);
-          widget.seekTo(targetPos * 1000);
-          setLocalTime(targetPos);
-        }
-      });
+      if (!isPlaylist) {
+        widget.getPosition((ms) => {
+          const curSec = ms / 1000;
+          if (Math.abs(curSec - targetPos) > 2.2) {
+            markRemoteSync(1500);
+            widget.seekTo(targetPos * 1000);
+            setLocalTime(targetPos);
+          }
+        });
+      } else if (
+        prevSynced &&
+        prevSynced.trackId === track.id &&
+        Math.abs(playback.positionSeconds - localTimeRef.current) > 2.2 &&
+        Date.now() + serverTimeOffset - playback.updatedAt < 3000
+      ) {
+        widget.seekTo(playback.positionSeconds * 1000);
+        setLocalTime(playback.positionSeconds);
+      }
       if (playback.isPlaying) {
         widget.play();
       } else {
@@ -851,10 +991,14 @@ export function MediaStage({
         widget.getDuration((ms) => {
           if (ms > 0) setDuration(ms / 1000);
         });
+        widget.getCurrentSoundIndex((idx) => {
+          if (typeof idx === 'number') scCurrentIndexRef.current = idx;
+        });
         widget.getPosition((ms) => {
+          scLastPosMsRef.current = ms;
           const cur = ms / 1000;
           if (!isScrubbing && Number.isFinite(cur)) setLocalTime(cur);
-          if (!hostMode && pb.isPlaying) {
+          if (!hostMode && pb.isPlaying && scSoundCountRef.current <= 1 && !track.sourceUrl.includes('/sets/')) {
             const expected = getAuthoritativePosition(pb, offset);
             if (Math.abs(cur - expected) > 2.5) {
               markRemoteSync();
