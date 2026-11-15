@@ -133,7 +133,7 @@ export default function App() {
       )}
 
       {/* Multi-Platform URL Input Bar */}
-      <AddTrackBar role={role} onAddTrack={addTrack} />
+      <AddTrackBar onAddTrack={addTrack} />
 
       {/* Main Listening Studio (Supports Theater Expand) */}
       <main className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-6 sm:px-6">

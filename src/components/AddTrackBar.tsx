@@ -1,6 +1,6 @@
 import { type FormEvent, useEffect, useState } from 'react';
 import { Link2, Loader2, Music2, Plus, X } from 'lucide-react';
-import type { MediaProvider, Role } from '../types/room';
+import type { MediaProvider } from '../types/room';
 import { getProviderLabel, parseMediaUrl } from '../utils/media';
 
 interface PreviewMeta {
@@ -13,7 +13,6 @@ interface PreviewMeta {
 }
 
 interface AddTrackBarProps {
-  role: Role;
   onAddTrack: (
     track: {
       id: string;
@@ -28,7 +27,7 @@ interface AddTrackBarProps {
   ) => void;
 }
 
-export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
+export function AddTrackBar({ onAddTrack }: AddTrackBarProps) {
   const [inputUrl, setInputUrl] = useState('');
   const [preview, setPreview] = useState<PreviewMeta | null>(null);
   const [isLoadingMeta, setIsLoadingMeta] = useState(false);
@@ -239,11 +238,6 @@ export function AddTrackBar({ role, onAddTrack }: AddTrackBarProps) {
           </div>
         )}
 
-        {!validationError && !preview && role === 'friend' && (
-          <p className="mt-2 text-xs text-[#9CA3AF]">
-            你目前以朋友身份加入：你可以自由貼上各平台連結加入待播清單，切換歌曲與播放進度由房主統一控制。
-          </p>
-        )}
       </div>
     </section>
   );
