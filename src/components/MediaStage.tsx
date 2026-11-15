@@ -309,6 +309,9 @@ export function MediaStage({
     onRequestSync,
   };
 
+  const localTimeRef = useRef(0);
+  localTimeRef.current = localTime;
+
   const getAuthoritativePosition = (pb: PlaybackState, offset: number) => {
     if (!pb.currentTrack) return 0;
     if (!pb.isPlaying) return pb.positionSeconds;
@@ -317,12 +320,12 @@ export function MediaStage({
     return pb.positionSeconds + elapsed;
   };
 
-  const markRemoteSync = () => {
+  const markRemoteSync = (durationMs = 1000) => {
     isRemoteSyncRef.current = true;
     if (remoteSyncTimerRef.current) window.clearTimeout(remoteSyncTimerRef.current);
     remoteSyncTimerRef.current = window.setTimeout(() => {
       isRemoteSyncRef.current = false;
-    }, 650);
+    }, durationMs);
   };
 
   // Track native fullscreen changes
@@ -428,6 +431,10 @@ export function MediaStage({
               setAutoplayBlocked(false);
               setPlayerError(null);
               endedDispatchedTrackIdRef.current = null;
+              const { volume: vol, isMuted: muted } = latestPropsRef.current;
+              event.target.setVolume(muted ? 0 : vol);
+              if (muted || vol === 0) event.target.mute();
+              else if (event.target.isMuted()) event.target.unMute();
               const dur = event.target.getDuration();
               if (dur > 0) setDuration(dur);
             }
@@ -516,7 +523,7 @@ export function MediaStage({
           });
           if (pb.currentTrack && pb.currentTrack.id === currentTrack.id) {
             const targetPos = getAuthoritativePosition(pb, offset);
-            markRemoteSync();
+            markRemoteSync(1500);
             if (targetPos > 0.5) widget.seekTo(targetPos * 1000);
             if (pb.isPlaying) widget.play();
             else widget.pause();
@@ -526,7 +533,17 @@ export function MediaStage({
         widget.bind(SC.Widget.Events.PLAY, () => {
           if (cancelled) return;
           setAutoplayBlocked(false);
-          const { isHost: hostMode, playback: pb, onPlay: emitPlay } = latestPropsRef.current;
+          const { isHost: hostMode, playback: pb, volume: vol, isMuted: muted, onPlay: emitPlay } =
+            latestPropsRef.current;
+          // Re-apply user volume when SoundCloud resumes/starts audio element
+          const targetVol = muted ? 0 : vol;
+          widget.setVolume(targetVol);
+          window.setTimeout(() => {
+            if (!cancelled && scWidgetRef.current === widget) {
+              widget.setVolume(latestPropsRef.current.isMuted ? 0 : latestPropsRef.current.volume);
+            }
+          }, 150);
+
           if (!isRemoteSyncRef.current && hostMode && pb.currentTrack && !pb.isPlaying) {
             widget.getPosition((ms) => emitPlay(ms / 1000));
           }
@@ -632,7 +649,10 @@ export function MediaStage({
         player.addEventListener(Twitch.Player.PLAY, () => {
           if (cancelled) return;
           setAutoplayBlocked(false);
-          const { isHost: hostMode, playback: pb, onPlay: emitPlay } = latestPropsRef.current;
+          const { isHost: hostMode, playback: pb, volume: vol, isMuted: muted, onPlay: emitPlay } =
+            latestPropsRef.current;
+          player.setVolume((muted ? 0 : vol) / 100);
+          player.setMuted(muted || vol === 0);
           if (!isRemoteSyncRef.current && hostMode && pb.currentTrack && !pb.isPlaying) {
             emitPlay(kind === 'video' ? player.getCurrentTime() : 0);
           }
@@ -746,16 +766,22 @@ export function MediaStage({
     // SoundCloud Sync
     if (track.provider === 'soundcloud' && scWidgetRef.current && scReadyRef.current) {
       const widget = scWidgetRef.current;
-      markRemoteSync();
+      const { volume: vol, isMuted: muted } = latestPropsRef.current;
+      markRemoteSync(1500);
+      widget.setVolume(muted ? 0 : vol);
       widget.getPosition((ms) => {
         const curSec = ms / 1000;
-        if (Math.abs(curSec - targetPos) > 2.0) {
+        if (Math.abs(curSec - targetPos) > 2.2) {
+          markRemoteSync(1500);
           widget.seekTo(targetPos * 1000);
           setLocalTime(targetPos);
         }
       });
-      if (playback.isPlaying) widget.play();
-      else widget.pause();
+      if (playback.isPlaying) {
+        widget.play();
+      } else {
+        widget.pause();
+      }
       return;
     }
 
@@ -887,12 +913,12 @@ export function MediaStage({
 
     safeSet('play', () => {
       if (latestPropsRef.current.isHost) {
-        latestPropsRef.current.onPlay(localTime);
+        latestPropsRef.current.onPlay(localTimeRef.current);
       }
     });
     safeSet('pause', () => {
       if (latestPropsRef.current.isHost) {
-        latestPropsRef.current.onPause(localTime);
+        latestPropsRef.current.onPause(localTimeRef.current);
       }
     });
     safeSet('previoustrack', isHost ? () => latestPropsRef.current.onPrev() : null);
@@ -904,12 +930,12 @@ export function MediaStage({
       safeSet('previoustrack', null);
       safeSet('nexttrack', null);
     };
-  }, [currentTrack, playback.isPlaying, isHost, localTime]);
+  }, [currentTrack, playback.isPlaying, isHost]);
 
-  // --- Resync when returning from background tab ---
+  // --- Resync friends when returning from background tab ---
   useEffect(() => {
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && !latestPropsRef.current.isHost) {
         latestPropsRef.current.onRequestSync();
       }
     };
@@ -919,6 +945,7 @@ export function MediaStage({
 
   const handleTogglePlay = () => {
     if (!isHost || !currentTrack) return;
+    applyVolumeToActivePlayer(volume, isMuted);
     if (playback.isPlaying) onPause(localTime);
     else onPlay(localTime);
   };
@@ -993,9 +1020,7 @@ export function MediaStage({
     if (currentTrack.provider === 'soundcloud') {
       const scSrc = `https://w.soundcloud.com/player/?url=${encodeURIComponent(
         currentTrack.sourceUrl,
-      )}&color=%23E59F3C&auto_play=${
-        playback.isPlaying ? 'true' : 'false'
-      }&hide_related=true&show_comments=false&show_user=true&show_reposts=false&show_teaser=false&visual=true`;
+      )}&color=%23E59F3C&auto_play=false&hide_related=true&show_comments=false&show_user=true&show_reposts=false&show_teaser=false&visual=true`;
       return (
         <iframe
           ref={scIframeRef}
