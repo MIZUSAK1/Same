@@ -86,6 +86,7 @@ interface SCNamespace {
       PAUSE: string;
       FINISH: string;
       ERROR: string;
+      PLAY_PROGRESS?: string;
     };
   };
 }
@@ -258,7 +259,12 @@ export function MediaStage({
   const scSoundCountRef = useRef(1);
   const scCurrentIndexRef = useRef(0);
   const scLastPosMsRef = useRef(0);
+  const scHadPlaybackProgressRef = useRef(false);
   const scPlaylistTransitionUntilRef = useRef(0);
+  const scPendingPauseTimerRef = useRef<number | null>(null);
+  const scContinueTimersRef = useRef<number[]>([]);
+  const scInitialTrackIdRef = useRef<string | null>(null);
+  const scInitialAutoPlayRef = useRef(false);
 
   const twitchContainerRef = useRef<HTMLDivElement | null>(null);
   const twitchPlayerRef = useRef<TwitchPlayerInstance | null>(null);
@@ -505,12 +511,28 @@ export function MediaStage({
 
   // --- 2. SoundCloud Widget Lifecycle ---
   useEffect(() => {
+    const clearPendingPause = () => {
+      if (scPendingPauseTimerRef.current) {
+        window.clearTimeout(scPendingPauseTimerRef.current);
+        scPendingPauseTimerRef.current = null;
+      }
+    };
+    const clearContinueTimers = () => {
+      for (const t of scContinueTimersRef.current) {
+        window.clearTimeout(t);
+      }
+      scContinueTimersRef.current = [];
+    };
+
     if (provider !== 'soundcloud' || !currentTrack) {
+      clearPendingPause();
+      clearContinueTimers();
       scWidgetRef.current = null;
       scReadyRef.current = false;
       scSoundCountRef.current = 1;
       scCurrentIndexRef.current = 0;
       scLastPosMsRef.current = 0;
+      scHadPlaybackProgressRef.current = false;
       scPlaylistTransitionUntilRef.current = 0;
       return;
     }
@@ -520,6 +542,7 @@ export function MediaStage({
     scSoundCountRef.current = currentTrack.sourceUrl.includes('/sets/') ? 2 : 1;
     scCurrentIndexRef.current = 0;
     scLastPosMsRef.current = 0;
+    scHadPlaybackProgressRef.current = false;
     scPlaylistTransitionUntilRef.current = 0;
     setPlayerError(null);
     setAutoplayBlocked(false);
@@ -561,8 +584,33 @@ export function MediaStage({
           }
         });
 
+        if (SC.Widget.Events.PLAY_PROGRESS) {
+          widget.bind(SC.Widget.Events.PLAY_PROGRESS, (rawEvent: unknown) => {
+            if (cancelled) return;
+            const ev = rawEvent as
+              | { currentPosition?: number; relativePosition?: number }
+              | undefined;
+            const posMs = ev?.currentPosition;
+            const rel = ev?.relativePosition;
+            if (typeof posMs === 'number' && Number.isFinite(posMs)) {
+              scLastPosMsRef.current = posMs;
+              if (posMs > 1500) scHadPlaybackProgressRef.current = true;
+            }
+            if (
+              typeof rel === 'number' &&
+              rel >= 0.985 &&
+              scSoundCountRef.current > 1 &&
+              scCurrentIndexRef.current < scSoundCountRef.current - 1
+            ) {
+              scPlaylistTransitionUntilRef.current = Date.now() + 3500;
+            }
+          });
+        }
+
         widget.bind(SC.Widget.Events.PLAY, () => {
           if (cancelled) return;
+          clearPendingPause();
+          clearContinueTimers();
           setAutoplayBlocked(false);
           const { isHost: hostMode, playback: pb, volume: vol, isMuted: muted, onPlay: emitPlay } =
             latestPropsRef.current;
@@ -577,6 +625,9 @@ export function MediaStage({
 
           widget.getCurrentSoundIndex((idx) => {
             if (!cancelled && typeof idx === 'number') {
+              if (idx !== scCurrentIndexRef.current) {
+                scHadPlaybackProgressRef.current = false;
+              }
               scCurrentIndexRef.current = idx;
             }
           });
@@ -597,41 +648,66 @@ export function MediaStage({
 
         widget.bind(SC.Widget.Events.PAUSE, () => {
           if (cancelled) return;
-          if (Date.now() < scPlaylistTransitionUntilRef.current) return;
-          const { isHost: hostMode, playback: pb, onPause: emitPause } = latestPropsRef.current;
-          if (
-            !isRemoteSyncRef.current &&
-            hostMode &&
-            pb.currentTrack &&
-            pb.isPlaying &&
-            !document.hidden
-          ) {
-            widget.getPosition((ms) => {
-              if (cancelled) return;
+          if (isRemoteSyncRef.current || Date.now() < scPlaylistTransitionUntilRef.current) return;
+          const { isHost: hostMode, playback: pb } = latestPropsRef.current;
+          if (!hostMode || !pb.currentTrack || !pb.isPlaying || document.hidden) return;
+
+          // Debounce PAUSE by 350ms so track-end / playlist-switch PAUSE events
+          // emitted right before FINISH or PLAY never falsely pause the room.
+          clearPendingPause();
+          scPendingPauseTimerRef.current = window.setTimeout(() => {
+            scPendingPauseTimerRef.current = null;
+            if (cancelled || scWidgetRef.current !== widget) return;
+            if (isRemoteSyncRef.current || Date.now() < scPlaylistTransitionUntilRef.current) {
+              return;
+            }
+            const {
+              isHost: latestHost,
+              playback: latestPb,
+              onPause: emitPause,
+            } = latestPropsRef.current;
+            if (!latestHost || !latestPb.currentTrack || !latestPb.isPlaying || document.hidden) {
+              return;
+            }
+
+            widget.isPaused((stillPaused) => {
+              if (cancelled || !stillPaused) return;
               if (isRemoteSyncRef.current || Date.now() < scPlaylistTransitionUntilRef.current) {
                 return;
               }
-              widget.getDuration((durMs) => {
+              widget.getPosition((ms) => {
                 if (cancelled) return;
-                const nearEnd = durMs > 0 && ms >= durMs - 1500;
-                const jumpedToStartOnPlaylist =
-                  scSoundCountRef.current > 1 && ms <= 500 && scLastPosMsRef.current > 2000;
-                if (nearEnd || jumpedToStartOnPlaylist) {
+                if (isRemoteSyncRef.current || Date.now() < scPlaylistTransitionUntilRef.current) {
                   return;
                 }
-                emitPause(ms / 1000);
+                widget.getDuration((durMs) => {
+                  if (cancelled) return;
+                  const nearEnd = durMs > 0 && ms >= durMs - 2000;
+                  const jumpedToStartOnPlaylist =
+                    scSoundCountRef.current > 1 && ms <= 800 && scHadPlaybackProgressRef.current;
+                  if (nearEnd || jumpedToStartOnPlaylist) {
+                    return;
+                  }
+                  emitPause(ms / 1000);
+                });
               });
             });
-          }
+          }, 350);
         });
 
         widget.bind(SC.Widget.Events.FINISH, () => {
           if (cancelled) return;
+          clearPendingPause();
           const { isHost: hostMode, playback: pb, onTrackEnded: emitEnded } = latestPropsRef.current;
           if (!pb.currentTrack) return;
 
           const prevIdx = scCurrentIndexRef.current;
           const knownCount = scSoundCountRef.current;
+          const likelyPlaylist = knownCount > 1 || pb.currentTrack.sourceUrl.includes('/sets/');
+          if (likelyPlaylist) {
+            scPlaylistTransitionUntilRef.current = Date.now() + 4500;
+            markRemoteSync(4500);
+          }
 
           widget.getSounds((sounds) => {
             if (cancelled) return;
@@ -645,9 +721,11 @@ export function MediaStage({
                 isPlaylist && (prevIdx < total - 1 || currentIdx < total - 1);
 
               if (hasMoreInPlaylist) {
-                scPlaylistTransitionUntilRef.current = Date.now() + 2500;
+                scPlaylistTransitionUntilRef.current = Date.now() + 4500;
                 scLastPosMsRef.current = 0;
-                markRemoteSync(2500);
+                scHadPlaybackProgressRef.current = false;
+                markRemoteSync(4500);
+                clearContinueTimers();
 
                 const ensurePlaylistContinues = () => {
                   if (cancelled || scWidgetRef.current !== widget) return;
@@ -671,11 +749,16 @@ export function MediaStage({
                   }
                 };
 
-                window.setTimeout(ensurePlaylistContinues, 300);
-                window.setTimeout(ensurePlaylistContinues, 800);
+                scContinueTimersRef.current = [
+                  window.setTimeout(ensurePlaylistContinues, 200),
+                  window.setTimeout(ensurePlaylistContinues, 600),
+                  window.setTimeout(ensurePlaylistContinues, 1200),
+                  window.setTimeout(ensurePlaylistContinues, 2000),
+                ];
                 return;
               }
 
+              scPlaylistTransitionUntilRef.current = 0;
               if (
                 hostMode &&
                 pb.currentTrack &&
@@ -694,6 +777,8 @@ export function MediaStage({
 
     return () => {
       cancelled = true;
+      clearPendingPause();
+      clearContinueTimers();
       scReadyRef.current = false;
       scWidgetRef.current = null;
     };
@@ -991,11 +1076,14 @@ export function MediaStage({
         widget.getDuration((ms) => {
           if (ms > 0) setDuration(ms / 1000);
         });
-        widget.getCurrentSoundIndex((idx) => {
-          if (typeof idx === 'number') scCurrentIndexRef.current = idx;
-        });
         widget.getPosition((ms) => {
           scLastPosMsRef.current = ms;
+          if (ms > 1500) {
+            scHadPlaybackProgressRef.current = true;
+            widget.getCurrentSoundIndex((idx) => {
+              if (typeof idx === 'number') scCurrentIndexRef.current = idx;
+            });
+          }
           const cur = ms / 1000;
           if (!isScrubbing && Number.isFinite(cur)) setLocalTime(cur);
           if (!hostMode && pb.isPlaying && scSoundCountRef.current <= 1 && !track.sourceUrl.includes('/sets/')) {
@@ -1162,9 +1250,15 @@ export function MediaStage({
     }
 
     if (currentTrack.provider === 'soundcloud') {
+      if (scInitialTrackIdRef.current !== currentTrack.id) {
+        scInitialTrackIdRef.current = currentTrack.id;
+        scInitialAutoPlayRef.current = playback.isPlaying;
+      }
       const scSrc = `https://w.soundcloud.com/player/?url=${encodeURIComponent(
         currentTrack.sourceUrl,
-      )}&color=%23E59F3C&auto_play=false&hide_related=true&show_comments=false&show_user=true&show_reposts=false&show_teaser=false&visual=true`;
+      )}&color=%23E59F3C&auto_play=${
+        scInitialAutoPlayRef.current ? 'true' : 'false'
+      }&hide_related=true&show_comments=false&show_user=true&show_reposts=false&show_teaser=false&visual=true`;
       return (
         <iframe
           ref={scIframeRef}
